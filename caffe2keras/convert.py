@@ -5,7 +5,7 @@ from functools import wraps
 from keras.layers import (ZeroPadding2D, Dropout, Conv2D, Flatten, Dense,
                           BatchNormalization, Activation, MaxPooling2D,
                           AveragePooling2D, Input, Multiply, Add, Maximum,
-                          Concatenate)
+                          Concatenate, Conv2DTranspose, Reshape, LeakyReLU, Cropping2D)
 from keras.models import Model
 
 from caffe2keras import caffe_pb2 as caffe
@@ -14,6 +14,10 @@ import google.protobuf.text_format
 from caffe2keras.caffe_utils import (layer_type, normalize_layers,
                                      get_output_names, is_data_input)
 from caffe2keras.extra_layers import Select
+from keras.backend import theano_backend as T
+import keras.backend as K
+from keras.engine.topology import Layer
+from lrn import LRN
 
 import numpy as np
 
@@ -86,6 +90,14 @@ def handle_concat(spec, bottoms):
     axis = spec.concat_param.axis
     return Concatenate(axis=axis, name=spec.name)(bottoms)
 
+@construct('lrn')
+def handle_concat(spec, bottoms):
+    local_size = spec.lrn_param.local_size
+    alpha = spec.lrn_param.alpha
+    beta = spec.lrn_param.beta
+    return LRN(alpha=alpha,beta=beta,n=local_size, name=spec.name, data_format='channels_first')(bottoms)
+
+
 
 @construct('convolution')
 def handle_conv(spec, bottom):
@@ -113,7 +125,7 @@ def handle_conv(spec, bottom):
 
     if pad_h + pad_w > 0:
         bottom = ZeroPadding2D(
-            padding=(pad_h, pad_w),
+            padding=(int(pad_h), int(pad_w)),
             name=spec.name + '_zeropadding',
             data_format='channels_first')(bottom)
 
@@ -131,6 +143,45 @@ def handle_conv(spec, bottom):
         dilation_rate=dilation,
         data_format='channels_first')(bottom)
 
+
+
+@construct('deconvolution')
+def handle_deconv(spec, bottom):
+        has_bias = spec.convolution_param.bias_term
+        nb_filter = spec.convolution_param.num_output
+        nb_col = (spec.convolution_param.kernel_size or
+                  [spec.convolution_param.kernel_h])[0]
+        nb_row = (spec.convolution_param.kernel_size or
+                  [spec.convolution_param.kernel_w])[0]
+        stride_h = (spec.convolution_param.stride or
+                    [spec.convolution_param.stride_h])[0] or 1
+        stride_w = (spec.convolution_param.stride or
+                    [spec.convolution_param.stride_w])[0] or 1
+        pad_h = (spec.convolution_param.pad or [spec.convolution_param.pad_h])[0]
+        pad_w = (spec.convolution_param.pad or [spec.convolution_param.pad_w])[0]
+
+        if(debug):
+            print("Deconv kernel")
+            print(str(nb_filter)+'x'+str(nb_col)+'x'+str(nb_row))
+            print("stride")
+            print(stride_h)
+            print("pad")
+            print(pad_h)
+
+        bottom = Conv2DTranspose(nb_filter,
+                               kernel_size =(nb_row, nb_col), use_bias=has_bias,
+                               strides=(stride_h, stride_w), name=spec.name,
+                               data_format='channels_first', padding='valid')(bottom)
+
+
+        if pad_h + pad_w > 0:
+            bottom = Cropping2D(((int(pad_w), int(pad_h))),
+                    name=spec.name + '_croping', data_format='channels_first') (bottom)
+        return bottom
+@construct('reshape')
+def handle_reshape(spec, bottom):
+    dim = spec.reshape_param.shape.dim
+    return Reshape(dim[1:], name=spec.name)(bottom)
 
 @construct('dropout')
 def handle_dropout(spec, bottom):
@@ -175,18 +226,27 @@ def handle_pooling(spec, bottom):
         print(pad_h)
         print(pad_w)
 
-    # XXX: This sometimes produces outputs which are too small by ~1px. IIRC
-    # Caffe uses a different method to Keras for computing output sizes. I've
-    # been using (fake) padding in my protoxtxts to get around the problem, but
-    # this should be fixed properly at some point.
+
+    print spec.name
     if pad_h + pad_w > 0:
         bottom = ZeroPadding2D(
             padding=(pad_h, pad_w),
             name=spec.name + '_zeropadding',
             data_format='channels_first')(bottom)
+    # XXX: This sometimes produces outputs which are too small by ~1px. IIRC
+    # Caffe uses a different method to Keras for computing output sizes. 
+    # All layers that have this issue should be listed here.
+    elif spec.name == 'pool1/3x3_s2' or spec.name == 'pool3/3x3_s2':
+        print "crutch"
+        bottom = ZeroPadding2D(
+            padding=((0, 1), (0, 1)),
+            name=spec.name + '_zeropadding',
+            data_format='channels_first')(bottom)
+	 
+		
+    border_mode = 'valid'
     if spec.pooling_param.pool == 0:  # MAX pooling
-        # border_mode = 'same'
-        border_mode = 'valid'
+        #border_mode = 'valid'
         if debug:
             print("MAX pooling")
         return MaxPooling2D(
@@ -196,7 +256,8 @@ def handle_pooling(spec, bottom):
             name=spec.name,
             data_format='channels_first')(bottom)
     elif (spec.pooling_param.pool == 1):  # AVE pooling
-        if debug:
+       
+	if debug:
             print("AVE pooling")
         return AveragePooling2D(
             pool_size=(kernel_h, kernel_w),
@@ -211,7 +272,8 @@ def handle_pooling(spec, bottom):
 
 @construct('relu')
 def handle_relu(spec, bottom):
-    return Activation('relu', name=spec.name)(bottom)
+    alpha = spec.relu_param.negative_slope
+    return LeakyReLU(alpha=alpha, name=spec.name)(bottom)
 
 
 @construct('sigmoid')
@@ -502,6 +564,7 @@ def convert_weights(param_layers, v='V1'):
 
     for layer in param_layers:
         typ = layer_type(layer)
+        print (layer.name)
         if typ == 'innerproduct':
             blobs = layer.blobs
 
@@ -572,10 +635,11 @@ def convert_weights(param_layers, v='V1'):
                 weights_beta.astype(dtype=np.float32)
             ]
 
-        elif typ == 'convolution':
+        elif typ == 'convolution' or typ == 'deconvolution':
             blobs = layer.blobs
+            #print (blobs)
 
-            if (v == 'V1'):
+            if  (v == 'V1'):
                 nb_filter = blobs[0].num
                 temp_stack_size = blobs[0].channels
                 nb_col = blobs[0].height
@@ -632,11 +696,14 @@ def convert_weights(param_layers, v='V1'):
 
             # caffe, unlike theano, does correlation not convolution. We need
             # to flip the weights 180 deg
-            weights_p = rot90(weights_p)
+            #
 
+            weights_p = rot90(weights_p)
+            #weights_p = weights_p[::-1, ::-1, ::-1, ::-1]
             # Keras needs h*w*i*o filters (where d is input, o is output), so
             # we transpose
-            weights_p = weights_p.transpose((3, 2, 1, 0))
+            weights_p = weights_p.transpose((2, 3, 1, 0))
+	    #weights_p = weights_p.transpose((3, 2, 1, 0))
 
             if weights_b is not None:
                 layer_weights = [
